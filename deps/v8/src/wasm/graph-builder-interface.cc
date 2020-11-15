@@ -74,11 +74,11 @@ constexpr uint32_t kNullCatch = static_cast<uint32_t>(-1);
 
 class WasmGraphBuildingInterface {
  public:
-  static constexpr Decoder::ValidateFlag validate = Decoder::kValidate;
+  static constexpr Decoder::ValidateFlag validate = Decoder::kFullValidation;
   using FullDecoder = WasmFullDecoder<validate, WasmGraphBuildingInterface>;
   using CheckForNull = compiler::WasmGraphBuilder::CheckForNull;
 
-  struct Value : public ValueBase {
+  struct Value : public ValueBase<validate> {
     TFNode* node = nullptr;
 
     template <typename... Args>
@@ -97,7 +97,7 @@ class WasmGraphBuildingInterface {
     explicit TryInfo(SsaEnv* c) : catch_env(c) {}
   };
 
-  struct Control : public ControlBase<Value> {
+  struct Control : public ControlBase<Value, validate> {
     SsaEnv* end_env = nullptr;    // end environment for the construct.
     SsaEnv* false_env = nullptr;  // false environment (only for if).
     TryInfo* try_info = nullptr;  // information about try statements.
@@ -436,11 +436,25 @@ class WasmGraphBuildingInterface {
               index.node, imm.offset, imm.alignment, decoder->position());
   }
 
+  void LoadLane(FullDecoder* decoder, LoadType type, const Value& value,
+                const Value& index, const MemoryAccessImmediate<validate>& imm,
+                const uint8_t laneidx, Value* result) {
+    result->node = BUILD(LoadLane, type.mem_type(), value.node, index.node,
+                         imm.offset, laneidx, decoder->position());
+  }
+
   void StoreMem(FullDecoder* decoder, StoreType type,
                 const MemoryAccessImmediate<validate>& imm, const Value& index,
                 const Value& value) {
     BUILD(StoreMem, type.mem_rep(), index.node, imm.offset, imm.alignment,
           value.node, decoder->position(), type.value_type());
+  }
+
+  void StoreLane(FullDecoder* decoder, StoreType type,
+                 const MemoryAccessImmediate<validate>& imm, const Value& index,
+                 const Value& value, const uint8_t laneidx) {
+    BUILD(StoreLane, type.mem_rep(), index.node, imm.offset, imm.alignment,
+          value.node, laneidx, decoder->position(), type.value_type());
   }
 
   void CurrentMemoryPages(FullDecoder* decoder, Value* result) {
@@ -792,8 +806,9 @@ class WasmGraphBuildingInterface {
     RttIsI31 rtt_is_i31 = rtt.type.heap_representation() == HeapType::kI31
                               ? RttIsI31::kRttIsI31
                               : RttIsI31::kRttIsNotI31;
+    uint8_t depth = rtt.type.depth();
     result->node = BUILD(RefTest, object.node, rtt.node, null_check, i31_check,
-                         rtt_is_i31);
+                         rtt_is_i31, depth);
   }
 
   void RefCast(FullDecoder* decoder, const Value& object, const Value& rtt,
@@ -810,12 +825,13 @@ class WasmGraphBuildingInterface {
     RttIsI31 rtt_is_i31 = rtt.type.heap_representation() == HeapType::kI31
                               ? RttIsI31::kRttIsI31
                               : RttIsI31::kRttIsNotI31;
+    uint8_t depth = rtt.type.depth();
     result->node = BUILD(RefCast, object.node, rtt.node, null_check, i31_check,
-                         rtt_is_i31, decoder->position());
+                         rtt_is_i31, depth, decoder->position());
   }
 
   void BrOnCast(FullDecoder* decoder, const Value& object, const Value& rtt,
-                Value* value_on_branch, uint32_t depth) {
+                Value* value_on_branch, uint32_t br_depth) {
     using CheckForI31 = compiler::WasmGraphBuilder::CheckForI31;
     using RttIsI31 = compiler::WasmGraphBuilder::RttIsI31;
     CheckForNull null_check = object.type.is_nullable()
@@ -828,16 +844,17 @@ class WasmGraphBuildingInterface {
     RttIsI31 rtt_is_i31 = rtt.type.heap_representation() == HeapType::kI31
                               ? RttIsI31::kRttIsI31
                               : RttIsI31::kRttIsNotI31;
+    uint8_t rtt_depth = rtt.type.depth();
     SsaEnv* match_env = Split(decoder->zone(), ssa_env_);
     SsaEnv* no_match_env = Steal(decoder->zone(), ssa_env_);
     no_match_env->SetNotMerged();
     BUILD(BrOnCast, object.node, rtt.node, null_check, i31_check, rtt_is_i31,
-          &match_env->control, &match_env->effect, &no_match_env->control,
-          &no_match_env->effect);
+          rtt_depth, &match_env->control, &match_env->effect,
+          &no_match_env->control, &no_match_env->effect);
     builder_->SetControl(no_match_env->control);
     SetEnv(match_env);
     value_on_branch->node = object.node;
-    BrOrRet(decoder, depth);
+    BrOrRet(decoder, br_depth);
     SetEnv(no_match_env);
   }
 
@@ -1071,33 +1088,20 @@ class WasmGraphBuildingInterface {
     BitVector* assigned = WasmDecoder<validate>::AnalyzeLoopAssignment(
         decoder, decoder->pc(), decoder->num_locals() + 1, decoder->zone());
     if (decoder->failed()) return;
-    if (assigned != nullptr) {
-      // Only introduce phis for variables assigned in this loop.
-      int instance_cache_index = decoder->num_locals();
-      for (int i = decoder->num_locals() - 1; i >= 0; i--) {
-        if (!assigned->Contains(i)) continue;
-        TFNode* inputs[] = {ssa_env_->locals[i], control()};
-        ssa_env_->locals[i] = builder_->Phi(decoder->local_type(i), 1, inputs);
-      }
-      // Introduce phis for instance cache pointers if necessary.
-      if (assigned->Contains(instance_cache_index)) {
-        builder_->PrepareInstanceCacheForLoop(&ssa_env_->instance_cache,
-                                              control());
-      }
+    DCHECK_NOT_NULL(assigned);
 
-      SetEnv(Split(decoder->zone(), ssa_env_));
-      builder_->StackCheck(decoder->position());
-      return;
-    }
-
-    // Conservatively introduce phis for all local variables.
+    // Only introduce phis for variables assigned in this loop.
+    int instance_cache_index = decoder->num_locals();
     for (int i = decoder->num_locals() - 1; i >= 0; i--) {
+      if (!assigned->Contains(i)) continue;
       TFNode* inputs[] = {ssa_env_->locals[i], control()};
       ssa_env_->locals[i] = builder_->Phi(decoder->local_type(i), 1, inputs);
     }
-
-    // Conservatively introduce phis for instance cache.
-    builder_->PrepareInstanceCacheForLoop(&ssa_env_->instance_cache, control());
+    // Introduce phis for instance cache pointers if necessary.
+    if (assigned->Contains(instance_cache_index)) {
+      builder_->PrepareInstanceCacheForLoop(&ssa_env_->instance_cache,
+                                            control());
+    }
 
     SetEnv(Split(decoder->zone(), ssa_env_));
     builder_->StackCheck(decoder->position());
@@ -1200,7 +1204,7 @@ DecodeResult BuildTFGraph(AccountingAllocator* allocator,
                           WasmFeatures* detected, const FunctionBody& body,
                           compiler::NodeOriginTable* node_origins) {
   Zone zone(allocator, ZONE_NAME);
-  WasmFullDecoder<Decoder::kValidate, WasmGraphBuildingInterface> decoder(
+  WasmFullDecoder<Decoder::kFullValidation, WasmGraphBuildingInterface> decoder(
       &zone, module, enabled, detected, body, builder);
   if (node_origins) {
     builder->AddBytecodePositionDecorator(node_origins, &decoder);

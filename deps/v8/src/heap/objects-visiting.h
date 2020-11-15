@@ -22,10 +22,8 @@ namespace internal {
   V(Cell)                              \
   V(Code)                              \
   V(CodeDataContainer)                 \
-  V(Context)                           \
   V(CoverageInfo)                      \
   V(DataHandler)                       \
-  V(DescriptorArray)                   \
   V(EmbedderDataArray)                 \
   V(EphemeronHashTable)                \
   V(FeedbackCell)                      \
@@ -41,7 +39,6 @@ namespace internal {
   V(JSWeakRef)                         \
   V(Map)                               \
   V(NativeContext)                     \
-  V(Oddball)                           \
   V(PreparseData)                      \
   V(PropertyArray)                     \
   V(PropertyCell)                      \
@@ -57,7 +54,6 @@ namespace internal {
   V(UncompiledDataWithoutPreparseData) \
   V(UncompiledDataWithPreparseData)    \
   V(WasmArray)                         \
-  V(WasmCapiFunctionData)              \
   V(WasmIndirectFunctionTable)         \
   V(WasmInstanceObject)                \
   V(WasmStruct)                        \

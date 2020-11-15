@@ -41,11 +41,15 @@ bool HandleBase::IsDereferenceAllowed() const {
       RootsTable::IsImmortalImmovable(root_index)) {
     return true;
   }
+  if (isolate->IsBuiltinsTableHandleLocation(location_)) return true;
 
   LocalHeap* local_heap = LocalHeap::Current();
   if (FLAG_local_heaps && local_heap) {
-    // Local heap can't access handles when parked
-    if (!local_heap->IsHandleDereferenceAllowed()) return false;
+    if (!local_heap->IsHandleDereferenceAllowed()) {
+      StdoutStream{} << "Cannot dereference handle owned by "
+                     << "non-running local heap\n";
+      return false;
+    }
 
     if (local_heap->ContainsPersistentHandle(location_) ||
         local_heap->ContainsLocalHandle(location_)) {
@@ -175,12 +179,12 @@ Address* CanonicalHandleScope::Lookup(Address object) {
       return isolate_->root_handle(root_index).location();
     }
   }
-  Address** entry = identity_map_->Get(Object(object));
-  if (*entry == nullptr) {
+  auto find_result = identity_map_->FindOrInsert(Object(object));
+  if (!find_result.already_exists) {
     // Allocate new handle location.
-    *entry = HandleScope::CreateHandle(isolate_, object);
+    *find_result.entry = HandleScope::CreateHandle(isolate_, object);
   }
-  return *entry;
+  return *find_result.entry;
 }
 
 std::unique_ptr<CanonicalHandlesMap>

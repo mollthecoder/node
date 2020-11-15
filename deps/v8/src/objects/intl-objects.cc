@@ -24,6 +24,7 @@
 #include "src/objects/js-number-format-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/property-descriptor.h"
+#include "src/objects/smi.h"
 #include "src/objects/string.h"
 #include "src/strings/string-case.h"
 #include "unicode/basictz.h"
@@ -1013,16 +1014,16 @@ MaybeHandle<String> Intl::StringLocaleConvertCase(Isolate* isolate,
 MaybeHandle<Object> Intl::StringLocaleCompare(
     Isolate* isolate, Handle<String> string1, Handle<String> string2,
     Handle<Object> locales, Handle<Object> options, const char* method) {
-  // We only cache the instance when both locales and options are undefined,
-  // as that is the only case when the specified side-effects of examining
-  // those arguments are unobservable.
-  bool can_cache =
-      locales->IsUndefined(isolate) && options->IsUndefined(isolate);
+  // We only cache the instance when locales is a string/undefined and
+  // options is undefined, as that is the only case when the specified
+  // side-effects of examining those arguments are unobservable.
+  bool can_cache = (locales->IsString() || locales->IsUndefined(isolate)) &&
+                   options->IsUndefined(isolate);
   if (can_cache) {
     // Both locales and options are undefined, check the cache.
     icu::Collator* cached_icu_collator =
         static_cast<icu::Collator*>(isolate->get_cached_icu_object(
-            Isolate::ICUObjectCacheType::kDefaultCollator));
+            Isolate::ICUObjectCacheType::kDefaultCollator, locales));
     // We may use the cached icu::Collator for a fast path.
     if (cached_icu_collator != nullptr) {
       return Intl::CompareStrings(isolate, *cached_icu_collator, string1,
@@ -1041,7 +1042,7 @@ MaybeHandle<Object> Intl::StringLocaleCompare(
       New<JSCollator>(isolate, constructor, locales, options, method), Object);
   if (can_cache) {
     isolate->set_icu_object_in_cache(
-        Isolate::ICUObjectCacheType::kDefaultCollator,
+        Isolate::ICUObjectCacheType::kDefaultCollator, locales,
         std::static_pointer_cast<icu::UMemory>(collator->icu_collator().get()));
   }
   icu::Collator* icu_collator = collator->icu_collator().raw();
@@ -1103,16 +1104,16 @@ MaybeHandle<String> Intl::NumberToLocaleString(Isolate* isolate,
   ASSIGN_RETURN_ON_EXCEPTION(isolate, numeric_obj,
                              Object::ToNumeric(isolate, num), String);
 
-  // We only cache the instance when both locales and options are undefined,
-  // as that is the only case when the specified side-effects of examining
-  // those arguments are unobservable.
-  bool can_cache =
-      locales->IsUndefined(isolate) && options->IsUndefined(isolate);
+  // We only cache the instance when locales is a string/undefined and
+  // options is undefined, as that is the only case when the specified
+  // side-effects of examining those arguments are unobservable.
+  bool can_cache = (locales->IsString() || locales->IsUndefined(isolate)) &&
+                   options->IsUndefined(isolate);
   if (can_cache) {
     icu::number::LocalizedNumberFormatter* cached_number_format =
         static_cast<icu::number::LocalizedNumberFormatter*>(
             isolate->get_cached_icu_object(
-                Isolate::ICUObjectCacheType::kDefaultNumberFormat));
+                Isolate::ICUObjectCacheType::kDefaultNumberFormat, locales));
     // We may use the cached icu::NumberFormat for a fast path.
     if (cached_number_format != nullptr) {
       return JSNumberFormat::FormatNumeric(isolate, *cached_number_format,
@@ -1133,7 +1134,7 @@ MaybeHandle<String> Intl::NumberToLocaleString(Isolate* isolate,
 
   if (can_cache) {
     isolate->set_icu_object_in_cache(
-        Isolate::ICUObjectCacheType::kDefaultNumberFormat,
+        Isolate::ICUObjectCacheType::kDefaultNumberFormat, locales,
         std::static_pointer_cast<icu::UMemory>(
             number_format->icu_number_formatter().get()));
   }
@@ -1275,28 +1276,72 @@ Maybe<Intl::NumberFormatDigitOptions> Intl::SetNumberFormatDigitOptions(
 
     // 15. Else If mnfd is not undefined or mxfd is not undefined, then
     if (!mnfd_obj->IsUndefined(isolate) || !mxfd_obj->IsUndefined(isolate)) {
-      // 15. b. Let mnfd be ? DefaultNumberOption(mnfd, 0, 20, mnfdDefault).
+      Handle<String> mxfd_str = factory->maximumFractionDigits_string();
       Handle<String> mnfd_str = factory->minimumFractionDigits_string();
-      if (!DefaultNumberOption(isolate, mnfd_obj, 0, 20, mnfd_default, mnfd_str)
+
+      int specified_mnfd;
+      int specified_mxfd;
+
+      // a. Let _specifiedMnfd_ be ? DefaultNumberOption(_mnfd_, 0, 20,
+      // *undefined*).
+      if (!DefaultNumberOption(isolate, mnfd_obj, 0, 20, -1, mnfd_str)
+               .To(&specified_mnfd)) {
+        return Nothing<NumberFormatDigitOptions>();
+      }
+      Handle<Object> specifiedMnfd_obj;
+      if (specified_mnfd < 0) {
+        specifiedMnfd_obj = factory->undefined_value();
+      } else {
+        specifiedMnfd_obj = handle(Smi::FromInt(specified_mnfd), isolate);
+      }
+
+      // b.  Let _specifiedMxfd_ be ? DefaultNumberOption(_mxfd_, 0, 20,
+      // *undefined*).
+      if (!DefaultNumberOption(isolate, mxfd_obj, 0, 20, -1, mxfd_str)
+               .To(&specified_mxfd)) {
+        return Nothing<NumberFormatDigitOptions>();
+      }
+      Handle<Object> specifiedMxfd_obj;
+      if (specified_mxfd < 0) {
+        specifiedMxfd_obj = factory->undefined_value();
+      } else {
+        specifiedMxfd_obj = handle(Smi::FromInt(specified_mxfd), isolate);
+      }
+
+      // c. If _specifiedMxfd_ is not *undefined*, set _mnfdDefault_ to
+      // min(_mnfdDefault_, _specifiedMxfd_).
+      if (specified_mxfd >= 0) {
+        mnfd_default = std::min(mnfd_default, specified_mxfd);
+      }
+
+      // d. Set _mnfd_ to ! DefaultNumberOption(_specifiedMnfd_, 0, 20,
+      // _mnfdDefault_).
+      if (!DefaultNumberOption(isolate, specifiedMnfd_obj, 0, 20, mnfd_default,
+                               mnfd_str)
                .To(&mnfd)) {
         return Nothing<NumberFormatDigitOptions>();
       }
 
-      // 15. c. Let mxfdActualDefault be max( mnfd, mxfdDefault ).
-      int mxfd_actual_default = std::max(mnfd, mxfd_default);
-
-      // 15. d. Let mxfd be ? DefaultNumberOption(mxfd, mnfd, 20,
-      // mxfdActualDefault).
-      Handle<String> mxfd_str = factory->maximumFractionDigits_string();
-      if (!DefaultNumberOption(isolate, mxfd_obj, mnfd, 20, mxfd_actual_default,
-                               mxfd_str)
+      // e. Set _mxfd_ to ! DefaultNumberOption(_specifiedMxfd_, 0, 20,
+      // max(_mxfdDefault_, _mnfd_)).
+      if (!DefaultNumberOption(isolate, specifiedMxfd_obj, 0, 20,
+                               std::max(mxfd_default, mnfd), mxfd_str)
                .To(&mxfd)) {
         return Nothing<NumberFormatDigitOptions>();
       }
-      // 15. e. Set intlObj.[[MinimumFractionDigits]] to mnfd.
+
+      // f. If _mnfd_ is greater than _mxfd_, throw a *RangeError* exception.
+      if (mnfd > mxfd) {
+        THROW_NEW_ERROR_RETURN_VALUE(
+            isolate,
+            NewRangeError(MessageTemplate::kPropertyValueOutOfRange, mxfd_str),
+            Nothing<NumberFormatDigitOptions>());
+      }
+
+      // g. Set intlObj.[[MinimumFractionDigits]] to mnfd.
       digit_options.minimum_fraction_digits = mnfd;
 
-      // 15. f. Set intlObj.[[MaximumFractionDigits]] to mxfd.
+      // h. Set intlObj.[[MaximumFractionDigits]] to mxfd.
       digit_options.maximum_fraction_digits = mxfd;
       // Else If intlObj.[[Notation]] is "compact", then
     } else if (notation_is_compact) {

@@ -119,7 +119,9 @@ class SourceGroup {
 
 class SerializationData {
  public:
-  SerializationData() : size_(0) {}
+  SerializationData() = default;
+  SerializationData(const SerializationData&) = delete;
+  SerializationData& operator=(const SerializationData&) = delete;
 
   uint8_t* data() { return data_.get(); }
   size_t size() { return size_; }
@@ -139,15 +141,13 @@ class SerializationData {
   };
 
   std::unique_ptr<uint8_t, DataDeleter> data_;
-  size_t size_;
+  size_t size_ = 0;
   std::vector<std::shared_ptr<v8::BackingStore>> backing_stores_;
   std::vector<std::shared_ptr<v8::BackingStore>> sab_backing_stores_;
   std::vector<CompiledWasmModule> compiled_wasm_modules_;
 
  private:
   friend class Serializer;
-
-  DISALLOW_COPY_AND_ASSIGN(SerializationData);
 };
 
 class SerializationDataQueue {
@@ -608,7 +608,8 @@ class Shell : public i::AllStatic {
       v8::MaybeLocal<Value> global_object);
   static void DisposeRealm(const v8::FunctionCallbackInfo<v8::Value>& args,
                            int index);
-  static MaybeLocal<Module> FetchModuleTree(v8::Local<v8::Context> context,
+  static MaybeLocal<Module> FetchModuleTree(v8::Local<v8::Module> origin_module,
+                                            v8::Local<v8::Context> context,
                                             const std::string& file_name);
   static ScriptCompiler::CachedData* LookupCodeCache(Isolate* isolate,
                                                      Local<Value> name);
